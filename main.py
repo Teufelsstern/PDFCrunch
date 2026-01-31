@@ -2,23 +2,15 @@ import os
 import zipfile
 import py7zr
 import fitz
-import easyocr
+from paddleocr import PaddleOCR
 import numpy as np
-import torch
 from pathlib import Path
 from tkinter import Tk, filedialog
 from PIL import Image
 from typing import Tuple
-
-# Configuration
-USE_GPU = True  # Set to True to enable GPU acceleration for OCR (requires CUDA runtime)
-
-# Check if CUDA is actually available
-if USE_GPU and not torch.cuda.is_available():
-    print("WARNING: GPU requested but CUDA not available. Falling back to CPU.")
-    print(f"PyTorch version: {torch.__version__}")
-    print("Install CUDA-enabled PyTorch: pip install torch --index-url https://download.pytorch.org/whl/cu118")
-    USE_GPU = False
+from ultralytics import YOLO
+import cv2
+import shutil
 
 
 def select_files():
@@ -86,30 +78,78 @@ def build_pdf_list(selected_paths: list[str]) -> list[Path]:
 
 
 def is_text_scan(img_array: np.ndarray) -> Tuple[bool, bool]:
-    """Check if image is a text scan (≥90% black/white pixels).
+    """Check if image is a text scan using edge density and connected components analysis.
 
     Args:
         img_array: Image as numpy array
 
     Returns:
-        True if image is likely a text scan (90%+ black/white pixels)
+        Tuple of (is_text_scan, is_fully_redacted):
+        - is_text_scan: True if image contains predominantly text
+        - is_fully_redacted: True if image is mostly blacked out (>50% black pixels)
     """
     # Convert to grayscale
     if len(img_array.shape) == 3:
-        grayscale = np.mean(img_array, axis=2)
+        grayscale = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
     else:
-        grayscale = img_array
+        grayscale = img_array.astype(np.uint8)
 
-    # Count black, white, and gray pixels
-    black_pixels = np.sum(grayscale < 50)  # Very dark
-    white_pixels = np.sum(grayscale > 200)  # Very light
-    total_pixels = grayscale.size
+    height, width = grayscale.shape
+    total_pixels = height * width
 
-    # Calculate percentage of black/white pixels
-    bw_percentage = (black_pixels + white_pixels) / total_pixels
-    b_percentage = (black_pixels) / total_pixels
+    # Quick check for fully blacked out images
+    black_pixels = np.sum(grayscale < 20)
+    if black_pixels / total_pixels > 0.5:
+        return False, True  # Not text, is redacted
 
-    return bw_percentage >= 0.90, b_percentage >= 0.5
+    # Edge detection using Canny
+    edges = cv2.Canny(grayscale, 50, 150)
+    edge_density = np.sum(edges > 0) / total_pixels
+
+    # Text documents typically have 8-25% edge density (stricter range)
+    if edge_density < 0.08 or edge_density > 0.30:
+        return False, False  # Too few or too many edges for substantial text
+
+    # Connected components analysis
+    # Threshold image to binary
+    _, binary = cv2.threshold(grayscale, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Find connected components
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        cv2.bitwise_not(binary), connectivity=8
+    )
+
+    # Analyze components (skip background label 0)
+    text_like_components = 0
+    min_component_size = 15  # Minimum pixels for a component (stricter)
+    max_component_size = total_pixels * 0.08  # Max 8% of image (stricter)
+
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        width_comp = stats[i, cv2.CC_STAT_WIDTH]
+        height_comp = stats[i, cv2.CC_STAT_HEIGHT]
+
+        # Filter by size
+        if area < min_component_size or area > max_component_size:
+            continue
+
+        # Calculate aspect ratio
+        if height_comp > 0:
+            aspect_ratio = width_comp / height_comp
+        else:
+            continue
+
+        # Text characters typically have aspect ratios between 0.2 and 4.0 (stricter)
+        if 0.2 <= aspect_ratio <= 4.0:
+            text_like_components += 1
+
+    # If we have many text-like components relative to image size,
+    # it's likely a text scan (higher threshold = less sensitive)
+    component_density = text_like_components / (total_pixels / 1000)  # per 1000 pixels
+
+    is_text = component_density > 2.0 and edge_density > 0.10
+
+    return is_text, False
 
 
 def find_text_region(img_array: np.ndarray, skip_amount: int = 0) -> tuple[int, int] | None:
@@ -144,23 +184,22 @@ def find_text_region(img_array: np.ndarray, skip_amount: int = 0) -> tuple[int, 
     skip_amount = max(0, min(skip_amount, len(dark_pixels_per_row) - 1))
 
     if black_percent > blackout_threshold:
-        print(f"Page probably blacked out ({black_percent*100:.1f}% black pixels), won't read.")
         return None
     for i, count in enumerate(dark_pixels_per_row[skip_amount:], start=skip_amount):
         if count > significant_threshold:
             # Found first text row - define region around it
-            top = i
-            bottom = min(height, int(i + height * 0.05))  # 10% below
+            top = max(0, int(i - height * 0.05))
+            bottom = min(height, int(i + height * 0.15))  # 10% below
             return top, bottom
     return None
 
 
-def ocr_image_region(img_array: np.ndarray, reader: easyocr.Reader, use_find_region: bool = True, debug: bool = False, min_words: int = 10) -> str:
+def ocr_image_region(img_array: np.ndarray, reader: PaddleOCR, use_find_region: bool = True, debug: bool = False, min_words: int = 10) -> str:
     """Run OCR on image with optional region detection for performance.
 
     Args:
         img_array: Image as numpy array
-        reader: EasyOCR reader instance
+        reader: PaddleOCR instance
         use_find_region: If True, try to find text region first for faster OCR
         debug: If True, print debug information about region detection
         min_words: Minimum words to extract before stopping region search
@@ -168,7 +207,7 @@ def ocr_image_region(img_array: np.ndarray, reader: easyocr.Reader, use_find_reg
     Returns:
         Extracted text as string
     """
-    all_ocr_results = []
+    all_text_results = []
     skip_amount = 0
     max_iterations = 5  # Prevent infinite loops
 
@@ -188,14 +227,25 @@ def ocr_image_region(img_array: np.ndarray, reader: easyocr.Reader, use_find_reg
                 print(f"      [find_region] Iteration {iteration + 1}: rows {top}-{bottom} (height: {region_height}px, {region_height/img_height*100:.1f}% of image)")
 
             cropped = img_array[top:bottom, :]
-            ocr_results = reader.readtext(cropped, detail=0)
 
-            if ocr_results:
-                all_ocr_results.extend(ocr_results)
-                word_count = len(" ".join(all_ocr_results).split())
+            # PaddleOCR expects RGB, convert if needed
+            if len(cropped.shape) == 2:  # Grayscale
+                cropped = np.stack([cropped] * 3, axis=-1)
+
+            # PaddleOCR 3.4.0 returns: [{'rec_texts': [...], 'rec_scores': [...], ...}]
+            result = reader.predict(cropped)
+
+            # Extract text from PaddleOCR result
+            texts = []
+            if result and len(result) > 0 and 'rec_texts' in result[0]:
+                texts = result[0]['rec_texts']  # List of recognized text strings
+
+            if texts:
+                all_text_results.extend(texts)
+                word_count = len(" ".join(all_text_results).split())
 
                 if debug:
-                    print(f"      [find_region] Found {len(ocr_results)} text blocks, total words: {word_count}")
+                    print(f"      [find_region] Found {len(texts)} text lines, total words: {word_count}")
 
                 if word_count >= min_words:
                     break
@@ -206,42 +256,50 @@ def ocr_image_region(img_array: np.ndarray, reader: easyocr.Reader, use_find_reg
             if skip_amount >= img_height:
                 break
 
-    return " ".join(all_ocr_results)
+    return " ".join(all_text_results)
 
 
-def process_pdf_content(pdf_path: Path, words_per_page: int = 30) -> None:
+def process_pdf_content(pdf_path: Path, reader: PaddleOCR, yolo_model: YOLO, persons_dir: Path, words_per_page: int = 30) -> tuple[bool, bool]:
     """Unified PDF content processing: extract text, classify images, generate previews.
 
     Args:
         pdf_path: Path to PDF file
+        reader: PaddleOCR instance (initialized once, reused across PDFs)
+        yolo_model: YOLOv8 Pose model instance for person detection
+        persons_dir: Shared directory for saving images with detected persons
         words_per_page: Number of words to extract per page for preview
+
+    Returns:
+        Tuple of (text_found, person_found)
     """
     from io import BytesIO
 
     pdf_path = Path(pdf_path)
-    output_file = pdf_path.parent / f"{pdf_path.stem}_preview.txt"
-    output_dir = pdf_path.parent / pdf_path.stem
+    pdf_name = pdf_path.stem
+    output_file = pdf_path.parent / f"{pdf_name}_preview.txt"
+    output_dir = pdf_path.parent / pdf_name
     doc = fitz.open(pdf_path)
 
-    # Initialize OCR reader (lazy, only when needed)
-    reader = None
-
-    print(f"  Processing content...")
-
     page_contents = []
-    total_real_images = 0
+    total_images = 0
+    text_found = False
+    person_found = False
 
     for page_num in range(doc.page_count):
         page = doc[page_num]
 
-        # 1. Get normal text
+        # 1. Get normal text for preview
         normal_text = page.get_text().strip()
         normal_words = normal_text.split()
 
-        # 2. Get embedded images and classify
+        if len(normal_words) >= 10:
+            preview_words = normal_words[:words_per_page]
+            preview_text = " ".join(preview_words)
+            page_contents.append(f"Page {page_num + 1}: {preview_text}\n")
+            text_found = True
+
+        # 2. Process all embedded images uniformly
         image_list = page.get_images()
-        text_scans = []
-        real_images = []
 
         for img_index, img in enumerate(image_list):
             xref = img[0]
@@ -249,58 +307,38 @@ def process_pdf_content(pdf_path: Path, words_per_page: int = 30) -> None:
             image_bytes = base_image["image"]
             image_ext = base_image["ext"]
 
-            # Load image and classify
+            # Load image
             pil_image = Image.open(BytesIO(image_bytes))
             img_array = np.array(pil_image)
+
+            # Check if image contains text
             is_text, is_fully_redacted = is_text_scan(img_array)
-            if is_fully_redacted: # Skip pages that are probably fully blacked out
+
+            # Skip fully redacted images
+            if is_fully_redacted:
                 continue
+
+            # Save image to disk
+            save_image_to_disk(output_dir, image_bytes, image_ext, page_num + 1, img_index + 1)
+            total_images += 1
+
             if is_text:
-                text_scans.append((img_array, img_index + 1))
-            real_images.append((image_bytes, image_ext, img_index + 1))
+                # Contains text → run OCR
+                ocr_text = ocr_image_region(img_array, reader, use_find_region=False, debug=False)
+                ocr_words = ocr_text.split()[:words_per_page]
 
-        # 3. Save real images
-        for image_bytes, image_ext, img_index in real_images:
-            save_image_to_disk(output_dir, image_bytes, image_ext, page_num + 1, img_index)
-            total_real_images += 1
+                if ocr_words:
+                    embed_preview = " ".join(ocr_words)
+                    page_contents.append(f"  - page {page_num + 1} img {img_index + 1}: {embed_preview}\n")
+                    text_found = True
+                if len(ocr_words) > 10:
+                    continue
+                # Run YOLO if less than 10 words found
 
-        # 4. Generate preview
-        if len(normal_words) >= 10:
-            # Case A: Normal text available
-            preview_words = normal_words[:words_per_page]
-            preview_text = " ".join(preview_words)
-            page_contents.append(f"Page {page_num + 1}: {preview_text}\n")
-
-            # OCR embedded text scans
-            if text_scans:
-                if reader is None:
-                    reader = easyocr.Reader(["en"], gpu=USE_GPU, verbose=False)
-
-                for img_array, img_index in text_scans:
-                    print(f"    OCR embed{img_index} on page {page_num + 1}:")
-                    ocr_text = ocr_image_region(img_array, reader, use_find_region=True, debug=True)
-                    ocr_words = ocr_text.split()[:words_per_page]
-                    if ocr_words:
-                        embed_preview = " ".join(ocr_words)
-                        page_contents.append(f"  - embed{img_index}: {embed_preview}\n")
-
-        else:
-            # Case B: No normal text → OCR whole page
-            if reader is None:
-                reader = easyocr.Reader(["en"], gpu=USE_GPU, verbose=False)
-
-            # Render page as image
-            pix = page.get_pixmap(dpi=300)
-            page_img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
-                pix.height, pix.width, pix.n
-            )
-
-            print(f"    OCR full page {page_num + 1}:")
-            ocr_text = ocr_image_region(page_img_array, reader, use_find_region=True, debug=True)
-            ocr_words = ocr_text.split()[:words_per_page]
-            if ocr_words:
-                preview_text = " ".join(ocr_words)
-                page_contents.append(f"Page {page_num + 1}: {preview_text}\n")
+            # No or not much text → run YOLO directly
+            detected = yolo_scan(img_array, persons_dir, pdf_name, page_num + 1, img_index + 1, yolo_model)
+            if detected:
+                person_found = True
 
     doc.close()
 
@@ -308,22 +346,50 @@ def process_pdf_content(pdf_path: Path, words_per_page: int = 30) -> None:
     if page_contents:
         with open(output_file, "w", encoding="utf-8") as f:
             f.writelines(page_contents)
-        print(f"  Saved page previews to: {output_file}")
+
+    return text_found, person_found
+
+
+def process_pdfs(pdf_paths: list[Path], reader: PaddleOCR, yolo_model: YOLO) -> None:
+    """Process the list of PDF files.
+
+    Args:
+        pdf_paths: List of PDF file paths
+        reader: PaddleOCR instance (initialized once, reused across PDFs)
+        yolo_model: YOLOv8 Pose model instance for person detection
+    """
+    # Create shared directory for all detected persons
+    if pdf_paths:
+        persons_dir = pdf_paths[0].parent / "detected_persons"
     else:
-        print(f"  No text found in any page, skipping preview file")
+        persons_dir = Path("detected_persons")
 
-    # Report saved images
-    if total_real_images > 0:
-        print(f"  Saved {total_real_images} real images (excluded text scans) to: {output_dir}")
+    total = len(pdf_paths)
+    print(f"\nProcessing {total} PDF file(s):\n")
 
+    for idx, pdf_path in enumerate(pdf_paths, 1):
+        text_found, person_found = process_pdf_content(pdf_path, reader, yolo_model, persons_dir)
 
-def process_pdfs(pdf_paths: list[Path]) -> None:
-    """Process the list of PDF files."""
-    print(f"\nProcessing {len(pdf_paths)} PDF file(s):")
-    for pdf_path in pdf_paths:
-        print(f"  - {pdf_path}")
-        process_pdf_content(pdf_path)
-        analyze_content_layers(pdf_path)
+        # Format output
+        pdf_name = pdf_path.stem
+        text_status = "Yes" if text_found else "No"
+        person_status = "Yes" if person_found else "No"
+
+        print(f"[{idx}/{total}] {pdf_name}")
+        print(f"  Text: {text_status}  |  Person: {person_status}\n")
+
+        # Move PDF and preview.txt into extraction folder
+        output_dir = pdf_path.parent / pdf_name
+        if output_dir.exists():
+            # Move PDF
+            pdf_destination = output_dir / pdf_path.name
+            shutil.move(str(pdf_path), str(pdf_destination))
+
+            # Move preview.txt if it exists
+            preview_file = pdf_path.parent / f"{pdf_name}_preview.txt"
+            if preview_file.exists():
+                preview_destination = output_dir / preview_file.name
+                shutil.move(str(preview_file), str(preview_destination))
 
 
 def inspect_pdf_structure(pdf_path: Path) -> None:
@@ -427,13 +493,74 @@ def save_image_to_disk(
     return image_path
 
 
+def yolo_scan(
+    img_array: np.ndarray,
+    output_dir: Path,
+    pdf_name: str,
+    page_num: int,
+    img_index: int,
+    model: YOLO,
+) -> bool:
+    """Scan image for persons using YOLOv8 Pose model.
+
+    Args:
+        img_array: Image as numpy array
+        output_dir: Directory to save detected images
+        pdf_name: Name of the PDF file (without extension)
+        page_num: PDF page number (1-indexed)
+        img_index: Image index on page (1-indexed)
+        model: YOLOv8 Pose model instance
+
+    Returns:
+        True if person detected, False otherwise
+    """
+    # Run YOLO inference with confidence threshold
+    results = model(img_array, conf=0.5, verbose=False)
+
+    # Check if any person detected with sufficient keypoints
+    person_detected = False
+    for result in results:
+        if result.boxes is not None and len(result.boxes) > 0:
+            # Check if any detection is a person (class 0 in COCO)
+            for idx, box in enumerate(result.boxes):
+                person_class = int(box.cls[0])
+                if person_class == 0:  # Person class
+                    # Verify keypoints (YOLOv8-Pose has 17 keypoints per person)
+                    if result.keypoints is not None and len(result.keypoints.data) > idx:
+                        keypoints = result.keypoints.data[idx]  # Shape: (17, 3) - x, y, confidence
+                        # Count visible keypoints (confidence > 0.5)
+                        visible_keypoints = (keypoints[:, 2] > 0.5).sum().item()
+
+                        if visible_keypoints > 2:  # At least 3 keypoints visible
+                            person_detected = True
+                            break
+                    else:
+                        # No keypoints available, skip this detection
+                        continue
+
+    # Save image if person detected
+    if person_detected:
+        output_dir.mkdir(exist_ok=True)
+        output_filename = f"{pdf_name}_page_{page_num}_img_{img_index}.png"
+        output_path = output_dir / output_filename
+
+        # Convert to PIL Image and save
+        if len(img_array.shape) == 2:  # Grayscale
+            pil_image = Image.fromarray(img_array)
+        else:  # RGB/RGBA
+            pil_image = Image.fromarray(img_array)
+
+        pil_image.save(output_path)
+
+    return person_detected
+
+
 def analyze_content_layers(pdf_path: Path) -> list[Path]:
     """Analyze document for potential content masking techniques."""
     pdf_path = Path(pdf_path)
     doc = fitz.open(pdf_path)
     findings = []
 
-    print(f"\n  Content Layer Analysis:")
 
     for page_num in range(doc.page_count):
         page = doc[page_num]
@@ -446,6 +573,7 @@ def analyze_content_layers(pdf_path: Path) -> list[Path]:
                 if annot.type[0] == 12:  # Redaction annotation type
                     redaction_count += 1
         if redaction_count > 0:
+            print(f"\n  Content Layer Analysis:")
             finding = (
                 f"Page {page_num + 1}: Found {redaction_count} redaction annotation(s)"
             )
@@ -460,24 +588,6 @@ def analyze_content_layers(pdf_path: Path) -> list[Path]:
             )
             findings.append(finding)
             print(f"    [FOUND] {finding}")
-
-        # Check if page is fully rasterized (single large image covering page)
-        images = page.get_images()
-        text = page.get_text().strip()
-        if len(images) == 1 and len(text) < 50:
-            image_info = images[0]
-            xref = image_info[0]
-            base_image = doc.extract_image(xref)
-            width = base_image.get("width", 0)
-            height = base_image.get("height", 0)
-            page_area = page.rect.width * page.rect.height
-            image_area_estimate = width * height
-
-            # If image is large and text is minimal, likely rasterized
-            if image_area_estimate > (page_area * 0.5):
-                finding = f"Page {page_num + 1}: Appears to be rasterized (single large image, minimal extractable text)"
-                findings.append(finding)
-                print(f"    [FOUND] {finding}")
 
         # Check for suspicious text colors (white text, or text matching likely backgrounds)
         text_dict = page.get_text("dict")
@@ -503,9 +613,6 @@ def analyze_content_layers(pdf_path: Path) -> list[Path]:
 
     doc.close()
 
-    if not findings:
-        print(f"    No content masking indicators detected")
-
     return findings
 
 
@@ -528,7 +635,17 @@ def main():
         print("No PDF files found in selection. Exiting.")
         return
 
-    process_pdfs(pdf_list)
+    # Initialize PaddleOCR once for all PDFs
+    print("\nInitializing PaddleOCR...")
+    reader = PaddleOCR(use_textline_orientation=True, lang='en')
+    print("PaddleOCR ready!")
+
+    # Initialize YOLOv8 Pose model for person detection
+    print("Initializing YOLOv8 Pose model...")
+    yolo_model = YOLO('yolov8n-pose.pt')
+    print("YOLOv8 ready!\n")
+
+    process_pdfs(pdf_list, reader, yolo_model)
 
 
 if __name__ == "__main__":
