@@ -6,6 +6,11 @@ A tool for extracting visible content from PDF documents, classifying the extrac
 
 PDFCrunch processes PDF files to extract their visible content, performs data classification on the extracted information, and organizes the results in a structure that enables efficient search and analysis across large datasets.
 
+## Disclaimer
+
+Please take note of the provided AGPL license. You alone are responsible to always backup the data you intend to work with. This tool is not meant to delete any data in any use case. It cannot however be guaranteed not to do so in any shape or form.
+You are also solely responsible to not use this Tool for any Data you do not have permission to do so.
+
 ## Features
 
 - Extract visible text and content from PDF documents
