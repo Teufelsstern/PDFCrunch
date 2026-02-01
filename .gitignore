@@ -54,10 +54,18 @@ htmlcov/
 data/
 output/
 temp/
+ep/
 *.db
 *.sqlite
 *.sqlite3
+*.pt
 
 # Logs
 *.log
 logs/
+
+# Claude Code
+.claude/*.local.*
+.claude/cache/
+.claude/logs/
+CLAUDE.md
