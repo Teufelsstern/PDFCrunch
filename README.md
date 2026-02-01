@@ -13,6 +13,16 @@ PDFCrunch processes PDF files to extract their visible content, performs data cl
 - Optimize storage for high-volume data scanning
 - Support for batch processing of multiple PDF files
 
+## Expected Behavior
+**The PaddlePaddle messages are expected behavior and cannot be suppressed/ignored for now - At least I don't know how. Just ignore them at program start.**  
+This concerns:  
+- "Connectivity check to the model hoster has been skipped because `PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK` is enabled."  
+- "INFORMATION: Es konnten keine Dateien mit dem angegebenen Muster gefunden werden."  
+  
+This tool accepts either zip/7z files of PDFs or multiple PDFs. It will then extract those if applicable before scanning the files for text and images. 
+For now all images will be extracted and moved, together with a preview of the PDF's text into a subfolder named like the PDF. After processing, the PDF file is also moved into said folder to keep a clean structure.
+This is to possibly be toggleable in the future.
+
 ## Requirements
 
 - Python 3.11+
