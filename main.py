@@ -928,6 +928,11 @@ def main() -> None:
 
     print(f"\nSelected {len(selected_files)} file(s)")
 
+    permission_confirmation = input("Please verify that you have the permission to access and classify the data in the selected files (y/n): ").strip().lower() == 'y'
+    if not permission_confirmation:
+        print("This tool must not be used for data you do not have the permission to do so. Exiting.")
+        return
+
     pdf_list = build_pdf_list(selected_files)
 
     if not pdf_list:
