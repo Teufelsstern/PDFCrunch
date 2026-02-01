@@ -49,8 +49,20 @@ python -c "from paddleocr import PaddleOCR; print('PaddleOCR ready')"
 
 ## Usage
 
-Details coming soon.
+```bash
+python main.py
+```
+
+This launches a GUI file picker. Select PDF files or archives (zip/7z) containing PDFs.
+
+## Documentation
+
+For detailed documentation, see the [docs](./docs/) folder:
+
+- **[Architecture](./docs/architecture.md)** - Process flow and system design
+- **[Function Reference](./docs/function-reference.md)** - Complete API documentation
+- **[Output Structure](./docs/output-structure.md)** - File organization and naming
 
 ## License
 
-TBD
+GNU Affero General Public License v3.0
