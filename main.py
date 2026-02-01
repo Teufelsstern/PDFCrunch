@@ -1,6 +1,8 @@
 import os
 import warnings
 
+from traits.trait_types import false
+
 # Suppress all warnings globally
 warnings.filterwarnings("ignore")
 
@@ -327,7 +329,7 @@ def process_single_image(args: tuple[Any, ...]) -> tuple[str | None, bool]:
 
     Args:
         args: Tuple of (image_bytes, image_ext, img_array, page_num, img_index,
-                       output_dir, persons_dir, pdf_name, reader, words_per_page, skip_ocr)
+                       output_dir, persons_dir, pdf_name, reader, words_per_page, skip_ocr, save_all_images)
 
     Returns:
         Tuple of (ocr_preview_text or None, person_detected)
@@ -344,13 +346,13 @@ def process_single_image(args: tuple[Any, ...]) -> tuple[str | None, bool]:
         reader,
         words_per_page,
         skip_ocr,
+        save_all_images,
     ) = args
 
     is_text, is_fully_redacted = is_text_scan(img_array)
     if is_fully_redacted:
         return None, False
 
-    save_image_to_disk(output_dir, image_bytes, image_ext, page_num, img_index)
     ocr_preview = None
     person_detected = False
     if skip_ocr:
@@ -377,6 +379,10 @@ def process_single_image(args: tuple[Any, ...]) -> tuple[str | None, bool]:
                 img_array, persons_dir, pdf_name, page_num, img_index
             )
 
+    # Save image only if save_all_images is True
+    if save_all_images:
+        save_image_to_disk(output_dir, image_bytes, image_ext, page_num, img_index)
+
     return ocr_preview, person_detected
 
 
@@ -385,6 +391,9 @@ def process_pdf_content(
     reader: PaddleOCR,
     persons_dir: Path,
     words_per_page: int = 50,
+    generate_previews: bool = True,
+    save_all_images: bool = True,
+    move_files: bool = False,
 ) -> tuple[bool, bool, str, int]:
     """Unified PDF content processing: extract text, classify images, generate previews.
 
@@ -393,6 +402,9 @@ def process_pdf_content(
         reader: PaddleOCR instance (initialized once, reused across PDFs)
         persons_dir: Shared directory for saving images with detected persons
         words_per_page: Number of words to extract for preview (default: 50)
+        generate_previews: Whether to generate preview text files
+        save_all_images: Whether to save images without detected persons
+        move_files: Whether to move the processed pdf files into the created folders. Only applicable if either generate_previews or save_all_images is true
 
     Returns:
         Tuple of (text_found, person_found, extracted_text, page_count)
@@ -451,6 +463,7 @@ def process_pdf_content(
                         reader,
                         words_per_page,
                         True,
+                        save_all_images,
                     )
                 )
     else:
@@ -478,6 +491,7 @@ def process_pdf_content(
                         reader,
                         words_per_page,
                         False,
+                        save_all_images,
                     )
                 )
     page_count = doc.page_count
@@ -490,7 +504,7 @@ def process_pdf_content(
             if person_detected:
                 person_found = True
 
-    if page_contents:
+    if page_contents and generate_previews:
         with open(output_file, "w", encoding="utf-8") as f:
             f.writelines(page_contents)
 
@@ -544,32 +558,34 @@ def _initialize_worker(
     _total_pages_counter = total_pages_counter
 
 
-def _process_pdf_worker(args: tuple[Path, Path]) -> tuple[str, bool, bool, int]:
+def _process_pdf_worker(args: tuple[Path, Path, bool, bool, bool]) -> tuple[str, bool, bool, int]:
     """Worker function for processing a single PDF in multiprocessing.
 
     Args:
-        args: Tuple of (pdf_path, persons_dir)
+        args: Tuple of (pdf_path, persons_dir, generate_previews, save_all_images)
 
     Returns:
         Tuple of (pdf_name, text_found, person_found, page_count)
     """
-    pdf_path, persons_dir = args
+    pdf_path, persons_dir, generate_previews, save_all_images, move_files = args
     global _worker_reader, _total_pages_counter
     text_found, person_found, extracted_text, page_count = process_pdf_content(
-        pdf_path, _worker_reader, persons_dir
+        pdf_path, _worker_reader, persons_dir, generate_previews=generate_previews, save_all_images=save_all_images, move_files=move_files
     )
     if _total_pages_counter is not None:
         _total_pages_counter.value += page_count
 
     pdf_name = pdf_path.stem
-    output_dir = pdf_path.parent / pdf_name
-    output_dir.mkdir(exist_ok=True)
-    pdf_destination = output_dir / pdf_path.name
-    shutil.move(str(pdf_path), str(pdf_destination))
-    preview_file = pdf_path.parent / f"{pdf_name}_preview.txt"
-    if preview_file.exists():
-        preview_destination = output_dir / preview_file.name
-        shutil.move(str(preview_file), str(preview_destination))
+    if save_all_images or generate_previews:
+        output_dir = pdf_path.parent / pdf_name
+        output_dir.mkdir(exist_ok=True)
+        if move_files:
+            pdf_destination = output_dir / pdf_path.name
+            shutil.move(str(pdf_path), str(pdf_destination))
+        preview_file = pdf_path.parent / f"{pdf_name}_preview.txt"
+        if preview_file.exists():
+            preview_destination = output_dir / preview_file.name
+            shutil.move(str(preview_file), str(preview_destination))
 
     # Return status to main process for printing (Windows spawn doesn't show worker prints)
     return pdf_name, text_found, person_found, page_count
@@ -608,11 +624,13 @@ def _yolo_consumer_thread(
             print(f"Error in YOLO consumer: {e}", flush=True)
 
 
-def process_pdfs(pdf_paths: list[Path]) -> None:
+def process_pdfs(pdf_paths: list[Path], generate_previews: bool = True, save_all_images: bool = True, move_files: bool = False) -> None:
     """Process the list of PDF files using multiprocessing.
 
     Args:
         pdf_paths: List of PDF file paths
+        generate_previews: Whether to generate preview text files
+        save_all_images: Whether to save images without detected persons
     """
     import time
 
@@ -656,7 +674,7 @@ def process_pdfs(pdf_paths: list[Path]) -> None:
     )
     consumer_thread.start()
     print("Models initialized\n", flush=True)
-    tasks = [(pdf_path, persons_dir) for pdf_path in pdf_paths]
+    tasks = [(pdf_path, persons_dir, generate_previews, save_all_images, move_files) for pdf_path in pdf_paths]
     max_workers = min(cpu_count(), len(pdf_paths))
 
     with ProcessPoolExecutor(
@@ -916,10 +934,18 @@ def main() -> None:
         print("No PDF files found in selection. Exiting.")
         return
 
+    # Configuration prompts
+    print("\nConfiguration:")
+    generate_previews = input("Generate previews of text? (y/n): ").strip().lower() == 'y'
+    save_all_images = input("Save images without recognized persons? (y/n): ").strip().lower() == 'y'
+    move_files = False
+    if generate_previews or save_all_images:
+        move_files = input("Do you want the PDFs to be moved into the generated folders after processing? (y/n): ").strip().lower() == 'y'
+
     print(f"\nUsing {min(cpu_count(), len(pdf_list))} parallel workers")
     print("Models (PaddleOCR, YOLO) will be initialized in each worker process...\n")
 
-    process_pdfs(pdf_list)
+    process_pdfs(pdf_list, generate_previews=generate_previews, save_all_images=save_all_images, move_files=move_files)
 
 
 if __name__ == "__main__":
