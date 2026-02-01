@@ -55,6 +55,17 @@ python main.py
 
 This launches a GUI file picker. Select PDF files or archives (zip/7z) containing PDFs.
 
+## Extensibility
+
+**Text Processing Hook**: All extracted text from each PDF is available via the `all_text` variable (returned by `process_pdf_content()` at line 535 in `main.py`). This can be used for:
+- Keyword extraction
+- Sentiment analysis
+- Custom text parsing
+- Data classification
+- Full-text search indexing
+
+Currently, the text is extracted but not processed beyond preview generation. Modify `_process_pdf_worker()` (line 562) to add custom text processing logic.
+
 ## Documentation
 
 For detailed documentation, see the [docs](./docs/) folder:
